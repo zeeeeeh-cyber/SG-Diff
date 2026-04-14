@@ -31,10 +31,8 @@ This generative module is the core of our framework, responsible for:
 ### 1. Data Preparation & Splitting
 Before training, generate the 5-fold cross-validation splits. This splits the raw data randomly into reproducible training and testing text files.
 ```bash
-cd datasets
-python make_5fold_splits.py
-python prepare_hf_dataset.py
-cd ..
+python datasets/make_5fold_splits.py --root ./datasets
+python datasets/prepare_hf_dataset.py
 ```
 
 ### 2. Train the Prior Model

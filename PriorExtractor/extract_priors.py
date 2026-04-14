@@ -95,12 +95,12 @@ def extract_priors(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract priors")
     
-    parser.add_argument('--img_dir', type=str, default='datasets/artifactIma')
-    parser.add_argument('--mask_dir', type=str, default='dataProcessing/dataset_mask')
-    parser.add_argument('--sdf_dir', type=str, default='dataProcessing/dataset_sdf')
+    parser.add_argument('--img_dir', type=str, default='../datasets/artifactIma')
+    parser.add_argument('--mask_dir', type=str, default='../dataProcessing/dataset_mask')
+    parser.add_argument('--sdf_dir', type=str, default='../dataProcessing/dataset_sdf')
     
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_dental365')
-    parser.add_argument('--split_dir', type=str, default='datasets/splits')
+    parser.add_argument('--split_dir', type=str, default='../datasets/splits')
     parser.add_argument('--fold_idx', type=int, required=True, help='Which fold to use')
     parser.add_argument('--split_mode', type=str, choices=['train', 'test', 'none'], default='test', 
                         help='Which split to extract')

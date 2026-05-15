@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 from pathlib import Path
 
 import torch
@@ -47,33 +48,223 @@ from diffusers.utils.torch_utils import is_compiled_module
 if is_wandb_available():
     import wandb
 class MoEUNetWrapper(nn.Module):
-    def __init__(self, original_unet, num_classes=5):
+    def __init__(self, original_unet, num_classes=5, num_expert_up_blocks=2):
         super().__init__()
         self.unet = original_unet
         self.num_classes = num_classes
+        self.num_expert_up_blocks = num_expert_up_blocks
 
-        old_conv = self.unet.conv_out
-        in_c = old_conv.in_channels
-        out_c = old_conv.out_channels
-
-        self.experts = nn.ModuleList([
-            nn.Conv2d(
-                in_channels=in_c,
-                out_channels=out_c,
-                kernel_size=old_conv.kernel_size,
-                stride=old_conv.stride,
-                padding=old_conv.padding,
-                bias=(old_conv.bias is not None),
+        if len(self.unet.up_blocks) < num_expert_up_blocks:
+            raise ValueError(
+                f"UNet has only {len(self.unet.up_blocks)} up blocks, cannot make "
+                f"{num_expert_up_blocks} expert-specific."
             )
+
+        self.shared_up_block_count = len(self.unet.up_blocks) - num_expert_up_blocks
+        expert_template_blocks = self.unet.up_blocks[self.shared_up_block_count:]
+        self.experts = nn.ModuleList([
+            nn.ModuleList([copy.deepcopy(block) for block in expert_template_blocks])
             for _ in range(num_classes)
         ])
 
-        for expert in self.experts:
-            expert.weight.data.copy_(old_conv.weight.data)
-            if old_conv.bias is not None:
-                expert.bias.data.copy_(old_conv.bias.data)
+        for block in expert_template_blocks:
+            block.requires_grad_(False)
 
-        self.unet.conv_out = nn.Identity()
+    def _expand_timesteps(self, timesteps, batch_size, device):
+        if not torch.is_tensor(timesteps):
+            is_mps = device.type == "mps"
+            dtype = torch.float32 if isinstance(timesteps, float) else torch.int32 if is_mps else torch.int64
+            timesteps = torch.tensor([timesteps], dtype=dtype, device=device)
+        elif len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(device)
+        return timesteps.expand(batch_size)
+
+    def _prepare_attention_mask(self, attention_mask, dtype):
+        if attention_mask is None:
+            return None
+        attention_mask = (1 - attention_mask.to(dtype)) * -10000.0
+        return attention_mask.unsqueeze(1)
+
+    def _run_down_blocks(
+        self,
+        sample,
+        emb,
+        encoder_hidden_states,
+        attention_mask,
+        cross_attention_kwargs,
+        encoder_attention_mask,
+        down_block_additional_residuals,
+        down_intrablock_additional_residuals,
+    ):
+        down_block_res_samples = (sample,)
+        intrablock_residuals = list(down_intrablock_additional_residuals) if down_intrablock_additional_residuals is not None else None
+
+        for downsample_block in self.unet.down_blocks:
+            if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+                additional_residuals = None
+                if intrablock_residuals is not None and len(intrablock_residuals) > 0:
+                    additional_residuals = intrablock_residuals.pop(0)
+
+                block_kwargs = {
+                    "hidden_states": sample,
+                    "temb": emb,
+                    "encoder_hidden_states": encoder_hidden_states,
+                    "attention_mask": attention_mask,
+                    "cross_attention_kwargs": cross_attention_kwargs,
+                    "encoder_attention_mask": encoder_attention_mask,
+                }
+                if additional_residuals is not None:
+                    block_kwargs["additional_residuals"] = additional_residuals
+                try:
+                    sample, res_samples = downsample_block(**block_kwargs)
+                except TypeError:
+                    block_kwargs.pop("encoder_attention_mask", None)
+                    sample, res_samples = downsample_block(**block_kwargs)
+            else:
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+                if intrablock_residuals is not None and len(intrablock_residuals) > 0:
+                    sample = sample + intrablock_residuals.pop(0)
+
+            down_block_res_samples += res_samples
+
+        if down_block_additional_residuals is not None:
+            down_block_res_samples = tuple(
+                down_block_res_sample + down_block_additional_residual
+                for down_block_res_sample, down_block_additional_residual in zip(
+                    down_block_res_samples, down_block_additional_residuals
+                )
+            )
+
+        return sample, down_block_res_samples
+
+    def _run_mid_block(
+        self,
+        sample,
+        emb,
+        encoder_hidden_states,
+        attention_mask,
+        cross_attention_kwargs,
+        encoder_attention_mask,
+        mid_block_additional_residual,
+    ):
+        if self.unet.mid_block is not None:
+            if hasattr(self.unet.mid_block, "has_cross_attention") and self.unet.mid_block.has_cross_attention:
+                mid_kwargs = {
+                    "encoder_hidden_states": encoder_hidden_states,
+                    "attention_mask": attention_mask,
+                    "cross_attention_kwargs": cross_attention_kwargs,
+                    "encoder_attention_mask": encoder_attention_mask,
+                }
+                try:
+                    sample = self.unet.mid_block(sample, emb, **mid_kwargs)
+                except TypeError:
+                    mid_kwargs.pop("encoder_attention_mask", None)
+                    sample = self.unet.mid_block(sample, emb, **mid_kwargs)
+            else:
+                sample = self.unet.mid_block(sample, emb)
+
+        if mid_block_additional_residual is not None:
+            sample = sample + mid_block_additional_residual
+
+        return sample
+
+    def _run_up_block(
+        self,
+        upsample_block,
+        sample,
+        res_samples,
+        emb,
+        encoder_hidden_states,
+        attention_mask,
+        cross_attention_kwargs,
+        encoder_attention_mask,
+        upsample_size,
+    ):
+        if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
+            block_kwargs = {
+                "hidden_states": sample,
+                "temb": emb,
+                "res_hidden_states_tuple": res_samples,
+                "encoder_hidden_states": encoder_hidden_states,
+                "cross_attention_kwargs": cross_attention_kwargs,
+                "upsample_size": upsample_size,
+                "attention_mask": attention_mask,
+                "encoder_attention_mask": encoder_attention_mask,
+            }
+            try:
+                return upsample_block(**block_kwargs)
+            except TypeError:
+                block_kwargs.pop("encoder_attention_mask", None)
+                return upsample_block(**block_kwargs)
+
+        return upsample_block(
+            hidden_states=sample,
+            temb=emb,
+            res_hidden_states_tuple=res_samples,
+            upsample_size=upsample_size,
+        )
+
+    def _select_batch(self, value, mask):
+        if value is None or not torch.is_tensor(value) or value.shape[0] != mask.shape[0]:
+            return value
+        return value[mask]
+
+    def _run_expert_up_blocks(
+        self,
+        sample,
+        down_block_res_samples,
+        emb,
+        encoder_hidden_states,
+        attention_mask,
+        cross_attention_kwargs,
+        encoder_attention_mask,
+        class_id,
+        forward_upsample_size,
+    ):
+        batch_size = sample.shape[0]
+        expert_sample = torch.empty_like(sample)
+
+        for cid in torch.unique(class_id).tolist():
+            cid = int(cid)
+            if cid < 0 or cid >= self.num_classes:
+                raise ValueError(f"class_id={cid} out of range, should be in [0, {self.num_classes - 1}].")
+
+            mask = class_id == cid
+            hidden_states = sample[mask]
+            class_down_samples = tuple(res[mask] for res in down_block_res_samples)
+            class_emb = emb[mask]
+            class_encoder_hidden_states = self._select_batch(encoder_hidden_states, mask)
+            class_attention_mask = self._select_batch(attention_mask, mask)
+            class_encoder_attention_mask = self._select_batch(encoder_attention_mask, mask)
+
+            for local_i, upsample_block in enumerate(self.experts[cid]):
+                global_i = self.shared_up_block_count + local_i
+                is_final_block = global_i == len(self.unet.up_blocks) - 1
+                res_samples = class_down_samples[-len(upsample_block.resnets):]
+                class_down_samples = class_down_samples[:-len(upsample_block.resnets)]
+
+                upsample_size = None
+                if not is_final_block and forward_upsample_size and len(class_down_samples) > 0:
+                    upsample_size = class_down_samples[-1].shape[2:]
+
+                hidden_states = self._run_up_block(
+                    upsample_block,
+                    hidden_states,
+                    res_samples,
+                    class_emb,
+                    class_encoder_hidden_states,
+                    class_attention_mask,
+                    cross_attention_kwargs,
+                    class_encoder_attention_mask,
+                    upsample_size,
+                )
+
+            expert_sample[mask] = hidden_states.to(dtype=expert_sample.dtype)
+
+        if expert_sample.shape[0] != batch_size:
+            raise RuntimeError("Expert routing changed batch size unexpectedly.")
+
+        return expert_sample
 
     def forward(
         self,
@@ -82,58 +273,143 @@ class MoEUNetWrapper(nn.Module):
         encoder_hidden_states,
         class_id=None,
         cross_attention_kwargs=None,
+        attention_mask=None,
+        encoder_attention_mask=None,
+        timestep_cond=None,
+        class_labels=None,
+        added_cond_kwargs=None,
+        down_block_additional_residuals=None,
+        mid_block_additional_residual=None,
+        down_intrablock_additional_residuals=None,
         return_dict=True,
         **kwargs
     ):
+        cross_attention_kwargs = dict(cross_attention_kwargs) if cross_attention_kwargs is not None else None
         if class_id is None and cross_attention_kwargs is not None:
             if "class_id" in cross_attention_kwargs:
                 class_id = cross_attention_kwargs.pop("class_id")
-
-        outputs = self.unet(
-            sample=sample,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            cross_attention_kwargs=cross_attention_kwargs,
-            return_dict=True,
-            **kwargs
-        )
-
-        features = outputs.sample
 
         if class_id is None:
             raise ValueError("MoE mode must pass in class_id.")
 
         if not torch.is_tensor(class_id):
-            class_id = torch.tensor(class_id, device=features.device)
+            class_id = torch.tensor(class_id, device=sample.device)
 
-        class_id = class_id.to(device=features.device, dtype=torch.long).view(-1)
+        class_id = class_id.to(device=sample.device, dtype=torch.long).view(-1)
 
-        if class_id.shape[0] != features.shape[0]:
+        if class_id.shape[0] != sample.shape[0]:
             raise ValueError(
-                f"class_id batch size ({class_id.shape[0]}) does not match features batch size ({features.shape[0]})."
+                f"class_id batch size ({class_id.shape[0]}) does not match sample batch size ({sample.shape[0]})."
             )
 
-        out = torch.empty(
-            features.shape[0],
-            self.experts[0].out_channels,
-            features.shape[2],
-            features.shape[3],
-            device=features.device,
-            dtype=features.dtype,
+        default_overall_up_factor = 2 ** getattr(self.unet, "num_upsamplers", 0)
+        forward_upsample_size = False
+        if default_overall_up_factor > 0:
+            for dim in sample.shape[-2:]:
+                if dim % default_overall_up_factor != 0:
+                    forward_upsample_size = True
+                    break
+
+        attention_mask = self._prepare_attention_mask(attention_mask, sample.dtype)
+        encoder_attention_mask = self._prepare_attention_mask(encoder_attention_mask, sample.dtype)
+
+        if getattr(self.unet.config, "center_input_sample", False):
+            sample = 2 * sample - 1.0
+
+        batch_size = sample.shape[0]
+        timesteps = self._expand_timesteps(timestep, batch_size, sample.device)
+        t_emb = self.unet.time_proj(timesteps)
+        t_emb = t_emb.to(dtype=sample.dtype)
+        try:
+            emb = self.unet.time_embedding(t_emb, timestep_cond)
+        except TypeError:
+            emb = self.unet.time_embedding(t_emb)
+
+        if getattr(self.unet, "class_embedding", None) is not None:
+            if class_labels is None:
+                class_labels = class_id
+            if getattr(self.unet.config, "class_embed_type", None) == "timestep":
+                class_labels = self.unet.time_proj(class_labels)
+                class_labels = class_labels.to(dtype=sample.dtype)
+            class_emb = self.unet.class_embedding(class_labels).to(dtype=sample.dtype)
+            emb = emb + class_emb
+
+        aug_emb = None
+        if getattr(self.unet, "add_embedding", None) is not None and added_cond_kwargs is not None:
+            if getattr(self.unet.config, "addition_embed_type", None) == "text":
+                aug_emb = self.unet.add_embedding(encoder_hidden_states)
+        if aug_emb is not None:
+            emb = emb + aug_emb
+
+        if getattr(self.unet, "time_embed_act", None) is not None:
+            emb = self.unet.time_embed_act(emb)
+
+        if getattr(self.unet, "encoder_hid_proj", None) is not None:
+            encoder_hidden_states = self.unet.encoder_hid_proj(encoder_hidden_states)
+
+        sample = self.unet.conv_in(sample)
+        sample, down_block_res_samples = self._run_down_blocks(
+            sample,
+            emb,
+            encoder_hidden_states,
+            attention_mask,
+            cross_attention_kwargs,
+            encoder_attention_mask,
+            down_block_additional_residuals,
+            down_intrablock_additional_residuals,
         )
 
-        unique_cids = torch.unique(class_id).tolist()
-        for cid in unique_cids:
-            cid = int(cid)
-            if cid < 0 or cid >= self.num_classes:
-                raise ValueError(f"class_id={cid} out of range, should be in [0, {self.num_classes - 1}].")
+        sample = self._run_mid_block(
+            sample,
+            emb,
+            encoder_hidden_states,
+            attention_mask,
+            cross_attention_kwargs,
+            encoder_attention_mask,
+            mid_block_additional_residual,
+        )
 
-            mask = (class_id == cid)
-            out[mask] = self.experts[cid](features[mask])
+        for i, upsample_block in enumerate(self.unet.up_blocks[:self.shared_up_block_count]):
+            is_final_block = i == len(self.unet.up_blocks) - 1
+            res_samples = down_block_res_samples[-len(upsample_block.resnets):]
+            down_block_res_samples = down_block_res_samples[:-len(upsample_block.resnets)]
+
+            upsample_size = None
+            if not is_final_block and forward_upsample_size and len(down_block_res_samples) > 0:
+                upsample_size = down_block_res_samples[-1].shape[2:]
+
+            sample = self._run_up_block(
+                upsample_block,
+                sample,
+                res_samples,
+                emb,
+                encoder_hidden_states,
+                attention_mask,
+                cross_attention_kwargs,
+                encoder_attention_mask,
+                upsample_size,
+            )
+
+        sample = self._run_expert_up_blocks(
+            sample,
+            down_block_res_samples,
+            emb,
+            encoder_hidden_states,
+            attention_mask,
+            cross_attention_kwargs,
+            encoder_attention_mask,
+            class_id,
+            forward_upsample_size,
+        )
+
+        if getattr(self.unet, "conv_norm_out", None) is not None:
+            sample = self.unet.conv_norm_out(sample)
+            sample = self.unet.conv_act(sample)
+        sample = self.unet.conv_out(sample)
 
         if return_dict:
-            return UNet2DConditionOutput(sample=out)
-        return (out,)
+            return UNet2DConditionOutput(sample=sample)
+        return (sample,)
 
     @property
     def config(self):
@@ -661,6 +937,7 @@ def save_moe_experts(model, output_dir):
     torch.save(
         {
             "num_experts": model.num_classes,
+            "num_expert_up_blocks": model.num_expert_up_blocks,
             "experts_state_dict": model.experts.state_dict(),
         },
         os.path.join(moe_dir, "experts.pt"),
@@ -675,7 +952,12 @@ def load_moe_experts(model, input_dir):
 
     state = torch.load(expert_ckpt, map_location="cpu")
     state_dict = state.get("experts_state_dict", state)
-    model.experts.load_state_dict(state_dict)
+    try:
+        model.experts.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "MoE expert checkpoint is incompatible with the current last-two-decoder-block expert architecture. "
+        ) from exc
 
 
 def convert_to_np(image, resolution):

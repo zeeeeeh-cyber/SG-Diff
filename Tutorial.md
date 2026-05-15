@@ -96,7 +96,7 @@ accelerate launch --num_processes=1 --mixed_precision="fp16" \
 
 ### 2. MoE & ControlNet Joint Training
 
-Freeze the U-Net backbone, inject the Geometric Prior (SDF) into the newly initialized ControlNet, and train the Morphology-Aware Mixture-of-Experts (MoE) heads using the `class_json` from Stage 1:
+Freeze the U-Net backbone, inject the Geometric Prior (SDF) into the newly initialized ControlNet, and train the Morphology-Aware Mixture-of-Experts (MoE) using the `class_json` from Stage 1:
 
 ```bash
 accelerate launch --num_processes=1 train-controlnet.py \
@@ -115,6 +115,7 @@ accelerate launch --num_processes=1 train-controlnet.py \
     --original_image_column="file_name" \
     --edited_image_column="edited_image" \
     --edit_prompt_column="edit_prompt" \
+    --class_json="path/to/dataset_priors_oof/cls_preds" \
     --prior_dir="path/to/dataset_priors_oof/seg_probs" \
     --sdf_dir="path/to/dataset_priors_oof/sdf_preds" \
     --output_dir="sgdiff-moe-model" \
